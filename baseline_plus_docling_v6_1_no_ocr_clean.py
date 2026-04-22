@@ -1,3 +1,18 @@
+"""Конвертер PDF в Markdown на базе Docling с приоритетом no-OCR режима.
+
+Скрипт обрабатывает PDF-документы двумя режимами Docling — без OCR и с OCR —
+но в отличие от более ранней версии сначала пытается использовать no-OCR
+вариант и обращается к OCR только как к запасному варианту. После извлечения
+Markdown применяется набор эвристик для очистки шума, нормализации таблиц,
+исправления ссылок на изображения и подавления артефактов OCR.
+
+Основные задачи:
+- сохранить Markdown и изображения в формате, совместимом с требованиями;
+- уменьшить количество шумовых строк и мусорных блоков;
+- аккуратно нормализовать таблицы и битые ссылки на картинки;
+- использовать OCR только там, где no-OCR не справляется.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,7 +29,11 @@ os.environ.setdefault("GLOG_minloglevel", "2")
 
 
 def _apply_device_from_argv() -> None:
-    """Set DOCLING_DEVICE before importing Docling."""
+    """Устанавливает `DOCLING_DEVICE` из аргументов командной строки.
+
+    Переменная окружения должна быть выставлена до импорта Docling.
+    Если в аргументах указан `--device auto`, переменная не переопределяется.
+    """
     for i, arg in enumerate(sys.argv):
         if arg == "--device" and i + 1 < len(sys.argv):
             value = sys.argv[i + 1]
@@ -32,7 +51,12 @@ _apply_device_from_argv()
 
 
 def _patch_cv2_set_num_threads() -> None:
-    """Some Docling table code expects cv2.setNumThreads to exist."""
+    """Добавляет заглушку `cv2.setNumThreads`, если метода нет.
+
+    Некоторые внутренние части пайплайна Docling ожидают наличие этой
+    функции. Если OpenCV установлен в урезанной сборке, метод может
+    отсутствовать.
+    """
     try:
         import cv2  # type: ignore
     except ImportError:
@@ -76,7 +100,18 @@ _HEADINGISH_RE = re.compile(r"^(Раздел:|Глава\s*-)", flags=re.IGNOREC
 
 
 class QualityStats:
+    """Собирает простые эвристики качества по готовому markdown-тексту.
+
+    Атрибуты используются для последующего вычисления итогового score.
+    Чем выше score, тем вероятнее, что markdown более чистый и структурный.
+    """
+
     def __init__(self, text: str) -> None:
+        """Инициализирует набор метрик для оценки Markdown.
+
+        Args:
+            text: Готовый Markdown-текст документа.
+        """
         self.text_length = len(text)
         self.lines = text.splitlines()
         self.image_refs = len(_MD_IMAGE_REF_RE.findall(text))
@@ -91,6 +126,7 @@ class QualityStats:
         self.empty_tables = len(_EMPTY_TABLE_RE.findall(text))
 
     def score(self) -> float:
+        """Возвращает суммарный эвристический score качества Markdown."""
         score = 0.0
         score += min(self.text_length / 400.0, 40.0)
         score += self.headers * 1.5
@@ -103,6 +139,7 @@ class QualityStats:
 
 
 def _clear_cuda_cache() -> None:
+    """Очищает CUDA-кэш PyTorch, если GPU доступен."""
     try:
         import torch
     except ImportError:
@@ -113,6 +150,17 @@ def _clear_cuda_cache() -> None:
 
 
 def _doc_num_from_stem(stem: str) -> int:
+    """Извлекает номер документа из имени вида `document_NNN`.
+
+    Args:
+        stem: Имя файла без расширения.
+
+    Returns:
+        Номер документа без ведущих нулей.
+
+    Raises:
+        ValueError: Если формат имени не соответствует ожидаемому.
+    """
     parts = stem.rsplit("_", 1)
     if len(parts) != 2:
         raise ValueError(f"Invalid file stem: {stem}")
@@ -120,6 +168,12 @@ def _doc_num_from_stem(stem: str) -> int:
 
 
 def _move_or_convert_to_png(src: Path, dst: Path) -> None:
+    """Перемещает изображение в PNG или конвертирует JPG/JPEG в PNG.
+
+    Args:
+        src: Исходный путь к изображению.
+        dst: Итоговый путь к PNG-файлу.
+    """
     ext = src.suffix.lower()
     if ext in (".jpg", ".jpeg"):
         from PIL import Image
@@ -137,6 +191,20 @@ def _normalize_image_names(
     out_images_dir: Path,
     doc_num: int,
 ) -> str:
+    """Нормализует имена изображений под формат из ТЗ.
+
+    Все найденные изображения переименовываются в формат
+    `doc_<id>_image_<order>.png`, а ссылки внутри Markdown обновляются.
+
+    Args:
+        markdown: Исходный Markdown.
+        work_images_dir: Временная директория с артефактами Docling.
+        out_images_dir: Итоговая директория `images/`.
+        doc_num: Номер документа.
+
+    Returns:
+        Markdown с обновленными ссылками на изображения.
+    """
     out_images_dir.mkdir(parents=True, exist_ok=True)
     old_to_new: dict[str, str] = {}
     order = 1
@@ -162,6 +230,15 @@ def _normalize_image_names(
 
 
 def _remove_broken_image_refs(markdown: str, out_images_dir: Path) -> str:
+    """Удаляет ссылки на изображения, которых нет в итоговой папке.
+
+    Args:
+        markdown: Markdown-текст документа.
+        out_images_dir: Итоговая директория с изображениями.
+
+    Returns:
+        Markdown без битых ссылок на картинки.
+    """
     def _replace(match: re.Match[str]) -> str:
         rel_path = match.group(1)
         image_name = Path(rel_path).name
@@ -173,6 +250,7 @@ def _remove_broken_image_refs(markdown: str, out_images_dir: Path) -> str:
 
 
 def _is_obvious_noise_line(stripped: str) -> bool:
+    """Проверяет, похожа ли строка на шум или мусор."""
     if not stripped:
         return False
     if _DRAFT_RE.fullmatch(stripped):
@@ -187,11 +265,11 @@ def _is_obvious_noise_line(stripped: str) -> bool:
 
 
 def _cleanup_spaced_words(line: str) -> str:
+    """Аккуратно склеивает OCR-строки с большим числом односимвольных фрагментов."""
     stripped = line.strip()
     if "|" in line or stripped.startswith("#") or stripped.startswith("!["):
         return line
 
-    # Conservative: only join lines that look like OCR with many 1-letter fragments.
     if len(re.findall(r"\b\w\b", stripped)) >= 5:
         return re.sub(r"(?<=\b\w)\s+(?=\w\b)", "", line)
 
@@ -199,6 +277,7 @@ def _cleanup_spaced_words(line: str) -> str:
 
 
 def _merge_split_lines(lines: list[str]) -> list[str]:
+    """Сливает соседние строки, если они похожи на грубый OCR-разрыв слова."""
     merged: list[str] = []
     i = 0
 
@@ -243,6 +322,7 @@ def _merge_split_lines(lines: list[str]) -> list[str]:
 
 
 def _safe_join_split_words_in_line(line: str) -> str:
+    """Склеивает части слов внутри одной строки по консервативным правилам."""
     stripped = line.strip()
 
     if (
@@ -273,8 +353,6 @@ def _safe_join_split_words_in_line(line: str) -> str:
                 left = token
                 right = nxt
 
-                # Very conservative short-tail joins only for explicit OCR endings:
-                # Разуметь ся, Очутитьс я, Synergize d
                 if len(left) >= 6 and 1 <= len(right) <= 2:
                     right_l = right.lower()
                     if right_l in {"ся", "сь", "d", "s"}:
@@ -286,7 +364,6 @@ def _safe_join_split_words_in_line(line: str) -> str:
                         i += 3
                         continue
 
-                # Руководи тель / Наслаждени е / логи стический
                 if len(left) >= 6 and 3 <= len(right) <= 4:
                     endings = {
                         "тель", "ение", "ость", "ание", "овать",
@@ -304,6 +381,7 @@ def _safe_join_split_words_in_line(line: str) -> str:
 
 
 def _promote_headingish_lines(lines: list[str]) -> list[str]:
+    """Поднимает строки, похожие на заголовки, до уровня `##`."""
     out: list[str] = []
     for line in lines:
         stripped = line.strip()
@@ -321,6 +399,7 @@ def _promote_headingish_lines(lines: list[str]) -> list[str]:
 
 
 def _drop_garbage_lines(lines: list[str]) -> list[str]:
+    """Удаляет строки, похожие на шум, артефакты OCR и изолированный мусор."""
     cleaned: list[str] = []
     for idx, line in enumerate(lines):
         stripped = line.strip()
@@ -334,7 +413,6 @@ def _drop_garbage_lines(lines: list[str]) -> list[str]:
         if _is_obvious_noise_line(stripped):
             continue
 
-        # Numeric/percent-only noise only when isolated.
         if _PERCENT_ONLY_RE.fullmatch(stripped) or _NUMBER_ONLY_RE.fullmatch(stripped):
             if (not prev_line or _is_obvious_noise_line(prev_line) or prev_line.startswith("![")) and (
                 not next_line or _is_obvious_noise_line(next_line) or next_line.startswith("#") or next_line.startswith("![")
@@ -346,6 +424,7 @@ def _drop_garbage_lines(lines: list[str]) -> list[str]:
 
 
 def _table_row_cells(line: str) -> list[str]:
+    """Разбивает строку Markdown-таблицы на ячейки без крайних разделителей."""
     parts = [p.strip() for p in line.strip().split("|")]
     if len(parts) >= 3:
         return parts[1:-1]
@@ -353,6 +432,7 @@ def _table_row_cells(line: str) -> list[str]:
 
 
 def _is_bad_table_block(block: list[str]) -> bool:
+    """Определяет, выглядит ли таблица невалидной или шумовой."""
     pipe_lines = [line for line in block if "|" in line]
     if len(pipe_lines) < 2:
         return True
@@ -390,6 +470,7 @@ def _is_bad_table_block(block: list[str]) -> bool:
 
 
 def _normalize_tables(markdown: str) -> str:
+    """Очищает пустые и плохие таблицы, а также выравнивает строки таблиц."""
     markdown = _EMPTY_TABLE_RE.sub("", markdown)
 
     lines = markdown.splitlines()
@@ -421,6 +502,7 @@ def _normalize_tables(markdown: str) -> str:
 
 
 def _remove_caption_after_images(lines: list[str]) -> list[str]:
+    """Удаляет подписи формата `Рис. N.` сразу после Markdown-картинок."""
     out: list[str] = []
     for idx, line in enumerate(lines):
         stripped = line.strip()
@@ -432,6 +514,15 @@ def _remove_caption_after_images(lines: list[str]) -> list[str]:
 
 
 def postprocess_markdown(markdown: str, out_images_dir: Path) -> str:
+    """Выполняет полную постобработку Markdown после Docling.
+
+    Args:
+        markdown: Исходный Markdown от конвертера.
+        out_images_dir: Директория, где лежат итоговые изображения.
+
+    Returns:
+        Очищенный и нормализованный Markdown.
+    """
     text = markdown.replace("\r\n", "\n").replace("\r", "\n")
     text = _DRAFT_RE.sub("", text)
     text = text.replace("\u00a0", " ")
@@ -460,6 +551,16 @@ def _build_converter(
     no_table_structure: bool,
     full_quality: bool,
 ) -> DocumentConverter:
+    """Создает и настраивает экземпляр `DocumentConverter` для PDF.
+
+    Args:
+        no_ocr: Отключать ли OCR.
+        no_table_structure: Отключать ли восстановление структуры таблиц.
+        full_quality: Использовать ли более качественный режим.
+
+    Returns:
+        Готовый `DocumentConverter`.
+    """
     if full_quality:
         images_scale = 1.0
         table_options = TableStructureOptions(mode=TableFormerMode.ACCURATE)
@@ -490,6 +591,17 @@ def _extract_single_markdown(
     converter: DocumentConverter,
     mode_name: str,
 ) -> str:
+    """Извлекает Markdown для одного PDF в одном режиме конвертации.
+
+    Args:
+        pdf_path: Путь к PDF-документу.
+        output_dir: Итоговая директория вывода.
+        converter: Инициализированный Docling-конвертер.
+        mode_name: Имя режима, используемое для временной директории.
+
+    Returns:
+        Нормализованный Markdown-текст документа.
+    """
     stem = pdf_path.stem
     doc_num = _doc_num_from_stem(stem)
 
@@ -526,7 +638,7 @@ def _choose_best_markdown(
     no_ocr_converter: DocumentConverter,
     ocr_converter: DocumentConverter,
 ) -> str:
-    """Try no_ocr first; use OCR only as fallback."""
+    """Сначала пытается извлечь Markdown без OCR, а OCR использует только как запасной вариант."""
     try:
         return _extract_single_markdown(
             pdf_path=pdf_path,
@@ -549,6 +661,7 @@ def convert_pdf(
     no_ocr_converter: DocumentConverter,
     ocr_converter: DocumentConverter,
 ) -> None:
+    """Конвертирует один PDF в Markdown и сохраняет результат на диск."""
     markdown = _choose_best_markdown(
         pdf_path=pdf_path,
         output_dir=output_dir,
@@ -560,6 +673,7 @@ def convert_pdf(
 
 
 def main() -> None:
+    """Точка входа CLI для пакетной обработки pdf-документов."""
     parser = argparse.ArgumentParser(description="Baseline+ v6.1 no_ocr-first (Docling): PDF -> Markdown")
     parser.add_argument("--input-dir", type=Path, required=True, help="Directory with PDF files")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory")
